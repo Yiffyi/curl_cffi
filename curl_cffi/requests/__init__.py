@@ -28,6 +28,8 @@ __all__ = [
     "RetryStrategy",
     "RetryInfo",
     "AttemptInfo",
+    "RequestContext",
+    "CompleteInfo",
     "SendState",
     "CacheBackend",
     "FileCacheBackend",
@@ -40,7 +42,7 @@ from typing import Optional, TYPE_CHECKING, TypedDict
 
 from ..const import CurlWsFlag
 from ..curl import SendState
-from .retry import AttemptInfo, RetryInfo
+from .retry import AttemptInfo, CompleteInfo, RequestContext, RetryInfo
 from .cache import CacheBackend, FileCacheBackend
 from .cookies import Cookies, CookieTypes
 from .errors import RequestsError
@@ -142,6 +144,10 @@ def request(
         max_recv_speed: maximum receive speed, bytes per second.
         multipart: upload files using the multipart format, see examples for details.
         discard_cookies: discard cookies from server. Default to False.
+        on_attempt: synchronous observer receiving ``AttemptInfo`` per actual attempt.
+        on_complete: synchronous observer receiving ``CompleteInfo`` exactly once.
+            For streams this observes establishment, without consuming the body.
+        context: opaque metadata forwarded unchanged in observer ``request_context``.
 
     Returns:
         A ``Response`` object.

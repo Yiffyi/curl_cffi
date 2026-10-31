@@ -50,6 +50,8 @@ from .impersonate import BrowserTypeLiteral, ExtraFingerprints, ExtraFpDict
 from .models import Response
 from .retry import (
     AttemptCallback,
+    CompleteCallback,
+    RequestContext,
     RetryStrategy,
     RetryInfo,
     _RetryController,
@@ -114,6 +116,7 @@ if TYPE_CHECKING:
         max_redirects: int
         retry: Union[int, RetryStrategy]
         on_attempt: Optional[AttemptCallback]
+        on_complete: Optional[CompleteCallback]
         impersonate: Optional[Union[BrowserTypeLiteral, str, Fingerprint]]
         ja3: Optional[str]
         akamai: Optional[str]
@@ -174,8 +177,10 @@ if TYPE_CHECKING:
         stream: Optional[bool]
         retry: Optional[Union[int, RetryStrategy]]
         allow_replay: bool
+        context: Any
         idle_timeout: Optional[float]
         on_attempt: Optional[AttemptCallback]
+        on_complete: Optional[CompleteCallback]
 
 else:
 
@@ -223,6 +228,7 @@ class BaseSession(Generic[R]):
         max_redirects: int = 30,
         retry: Optional[Union[int, RetryStrategy]] = 0,
         on_attempt: Optional[AttemptCallback] = None,
+        on_complete: Optional[CompleteCallback] = None,
         impersonate: Optional[Union[BrowserTypeLiteral, str, Fingerprint]] = None,
         ja3: Optional[str] = None,
         akamai: Optional[str] = None,
@@ -255,6 +261,7 @@ class BaseSession(Generic[R]):
         self.max_redirects = max_redirects
         self.retry = _normalize_retry(retry)
         self.on_attempt = on_attempt
+        self.on_complete = on_complete
         self.impersonate = impersonate
         self.ja3 = ja3
         self.akamai = akamai
@@ -544,6 +551,9 @@ class Session(BaseSession[R]):
                 internal/private IP addresses (SSRF protection).
             max_redirects: max redirect counts, default 30, use -1 for unlimited.
             retry: number of retries or ``RetryStrategy`` for failed requests.
+            on_attempt: synchronous observer called once per actual attempt.
+            on_complete: synchronous observer called once per request; streaming
+                requests complete at final headers without consuming the body.
             impersonate: which browser version or fingerprint to impersonate
                 in the session.
             ja3: ja3 string to impersonate in the session.
@@ -990,6 +1000,8 @@ class Session(BaseSession[R]):
                 event_class=threading.Event,
             )
 
+            if _attempt_context is not None:
+                _attempt_context["request"] = req
             self._set_request_limits(c, _budget, _connect_timeout, stream)
         except BaseException:
             if stream:
@@ -1155,88 +1167,111 @@ class Session(BaseSession[R]):
         allow_replay: bool = False,
         idle_timeout: Optional[float] = None,
         on_attempt: Optional[AttemptCallback] = None,
+        on_complete: Optional[CompleteCallback] = None,
+        context: Any = None,
     ) -> R:
         """Send the request, see ``requests.request`` for details on parameters."""
 
-        self._check_session_closed()
-        if idle_timeout is not None and (
-            not math.isfinite(idle_timeout) or idle_timeout <= 0
-        ):
-            raise ValueError("idle_timeout must be > 0")
-
-        body = content if content is not None else data
-        body_position = _capture_body_position(data, content)
-        strategy = self.retry if retry is None else _normalize_retry(retry)
         controller = _RetryController(
-            strategy, allow_replay, on_attempt or self.on_attempt
+            self.retry,
+            allow_replay,
+            on_attempt or self.on_attempt,
+            RequestContext(method.upper(), url, bool(stream), context),
+            on_complete or self.on_complete,
         )
-        for _attempt in range(strategy.count + 1):
-            context = {
-                "started": False,
-                "send_state": SendState.NOT_STARTED,
-                "controller": controller,
-                "attempt": controller.attempts + 1,
-            }
-            if controller.remaining is not None and controller.remaining <= 0:
-                raise controller.budget_error()
-            try:
-                rsp = self._request_once(
-                    method=method,
-                    url=url,
-                    params=params,
-                    data=data,
-                    content=content,
-                    json=json,
-                    headers=headers,
-                    cookies=cookies,
-                    files=files,
-                    auth=auth,
-                    timeout=timeout,
-                    allow_redirects=allow_redirects,
-                    max_redirects=max_redirects,
-                    proxies=proxies,
-                    proxy=proxy,
-                    proxy_auth=proxy_auth,
-                    verify=verify,
-                    referer=referer,
-                    accept_encoding=accept_encoding,
-                    content_callback=content_callback,
-                    impersonate=impersonate,
-                    ja3=ja3,
-                    akamai=akamai,
-                    perk=perk,
-                    extra_fp=extra_fp,
-                    default_headers=default_headers,
-                    default_encoding=default_encoding,
-                    quote=quote,
-                    http_version=http_version,
-                    interface=interface,
-                    dns=dns,
-                    doh_url=doh_url,
-                    cert=cert,
-                    stream=stream,
-                    max_recv_speed=max_recv_speed,
-                    multipart=multipart,
-                    discard_cookies=discard_cookies,
-                    _budget=controller.timeout(
-                        self.timeout if timeout is NOT_SET else timeout
-                    ),
-                    _connect_timeout=strategy.connect_timeout,
-                    _attempt_context=context,
-                    idle_timeout=idle_timeout,
-                )
-            except Exception as error:
-                controller.attempts += int(context["started"])
-                controller.notify(error=error)
-                delay = controller.retry_delay(error, body, body_position, multipart)
-                if delay is None:
-                    raise
-                if delay:
-                    time.sleep(delay)
-            else:
-                controller.attempts += int(context["started"])
-                controller.notify(response=rsp)
-                return rsp
+        rsp = None
+        terminal_error = None
+        try:
+            self._check_session_closed()
+            if idle_timeout is not None and (
+                not math.isfinite(idle_timeout) or idle_timeout <= 0
+            ):
+                raise ValueError("idle_timeout must be > 0")
+
+            body = content if content is not None else data
+            body_position = _capture_body_position(data, content)
+            strategy = self.retry if retry is None else _normalize_retry(retry)
+            controller.strategy = strategy
+            for _attempt in range(strategy.count + 1):
+                attempt_context = {
+                    "started": False,
+                    "send_state": SendState.NOT_STARTED,
+                    "controller": controller,
+                    "attempt": controller.attempts + 1,
+                }
+                if controller.remaining is not None and controller.remaining <= 0:
+                    raise controller.budget_error()
+                try:
+                    rsp = self._request_once(
+                        method=method,
+                        url=url,
+                        params=params,
+                        data=data,
+                        content=content,
+                        json=json,
+                        headers=headers,
+                        cookies=cookies,
+                        files=files,
+                        auth=auth,
+                        timeout=timeout,
+                        allow_redirects=allow_redirects,
+                        max_redirects=max_redirects,
+                        proxies=proxies,
+                        proxy=proxy,
+                        proxy_auth=proxy_auth,
+                        verify=verify,
+                        referer=referer,
+                        accept_encoding=accept_encoding,
+                        content_callback=content_callback,
+                        impersonate=impersonate,
+                        ja3=ja3,
+                        akamai=akamai,
+                        perk=perk,
+                        extra_fp=extra_fp,
+                        default_headers=default_headers,
+                        default_encoding=default_encoding,
+                        quote=quote,
+                        http_version=http_version,
+                        interface=interface,
+                        dns=dns,
+                        doh_url=doh_url,
+                        cert=cert,
+                        stream=stream,
+                        max_recv_speed=max_recv_speed,
+                        multipart=multipart,
+                        discard_cookies=discard_cookies,
+                        _budget=controller.timeout(
+                            self.timeout if timeout is NOT_SET else timeout
+                        ),
+                        _connect_timeout=strategy.connect_timeout,
+                        _attempt_context=attempt_context,
+                        idle_timeout=idle_timeout,
+                    )
+                except BaseException as error:
+                    controller.request = attempt_context.get("request")
+                    controller.attempts += int(attempt_context["started"])
+                    if attempt_context["started"]:
+                        controller.notify(error=error)
+                    if not isinstance(error, Exception):
+                        raise
+                    delay = controller.retry_delay(
+                        error, body, body_position, multipart
+                    )
+                    if delay is None:
+                        raise
+                    if delay:
+                        time.sleep(delay)
+                else:
+                    controller.attempts += int(attempt_context["started"])
+                    controller.request = rsp.request
+                    if attempt_context["started"]:
+                        controller.notify(response=rsp)
+                    return rsp
+        except BaseException as error:
+            terminal_error = error
+            raise
+        finally:
+            controller.complete(response=rsp, error=terminal_error)
 
     def head(self, url: str, **kwargs: Unpack[RequestParams]) -> R:
         return self.request(method="HEAD", url=url, **kwargs)
@@ -1310,6 +1345,9 @@ class AsyncSession(BaseSession[R]):
                 internal/private IP addresses (SSRF protection).
             max_redirects: max redirect counts, default 30, use -1 for unlimited.
             retry: number of retries or ``RetryStrategy`` for failed requests.
+            on_attempt: synchronous observer called once per actual attempt.
+            on_complete: synchronous observer called once per request; streaming
+                requests complete at final headers without consuming the body.
             impersonate: which browser version or fingerprint to impersonate
                 in the session.
             ja3: ja3 string to impersonate in the session.
@@ -1876,6 +1914,8 @@ class AsyncSession(BaseSession[R]):
                 queue_class=asyncio.Queue,
                 event_class=asyncio.Event,
             )
+            if _attempt_context is not None:
+                _attempt_context["request"] = req
         # Catch BaseException so asyncio.CancelledError also returns the handle.
         except BaseException:
             self.release_curl(curl)
@@ -2039,100 +2079,123 @@ class AsyncSession(BaseSession[R]):
         allow_replay: bool = False,
         idle_timeout: Optional[float] = None,
         on_attempt: Optional[AttemptCallback] = None,
+        on_complete: Optional[CompleteCallback] = None,
+        context: Any = None,
     ) -> R:
         """Send the request, see ``curl_cffi.requests.request`` for details on args."""
 
-        self._check_session_closed()
-        if idle_timeout is not None and (
-            not math.isfinite(idle_timeout) or idle_timeout <= 0
-        ):
-            raise ValueError("idle_timeout must be > 0")
-
-        body = content if content is not None else data
-        body_position = _capture_body_position(data, content)
-        strategy = self.retry if retry is None else _normalize_retry(retry)
         controller = _RetryController(
-            strategy, allow_replay, on_attempt or self.on_attempt
+            self.retry,
+            allow_replay,
+            on_attempt or self.on_attempt,
+            RequestContext(method.upper(), url, bool(stream), context),
+            on_complete or self.on_complete,
         )
-        for _attempt in range(strategy.count + 1):
-            context = {
-                "started": False,
-                "send_state": SendState.NOT_STARTED,
-                "controller": controller,
-                "attempt": controller.attempts + 1,
-            }
-            if controller.remaining is not None and controller.remaining <= 0:
-                raise controller.budget_error()
-            try:
-                operation = self._request_once(
-                    method=method,
-                    url=url,
-                    params=params,
-                    data=data,
-                    content=content,
-                    json=json,
-                    headers=headers,
-                    cookies=cookies,
-                    files=files,
-                    auth=auth,
-                    timeout=timeout,
-                    allow_redirects=allow_redirects,
-                    max_redirects=max_redirects,
-                    proxies=proxies,
-                    proxy=proxy,
-                    proxy_auth=proxy_auth,
-                    verify=verify,
-                    referer=referer,
-                    accept_encoding=accept_encoding,
-                    content_callback=content_callback,
-                    impersonate=impersonate,
-                    ja3=ja3,
-                    akamai=akamai,
-                    perk=perk,
-                    extra_fp=extra_fp,
-                    default_headers=default_headers,
-                    default_encoding=default_encoding,
-                    quote=quote,
-                    http_version=http_version,
-                    interface=interface,
-                    dns=dns,
-                    doh_url=doh_url,
-                    cert=cert,
-                    stream=stream,
-                    max_recv_speed=max_recv_speed,
-                    multipart=multipart,
-                    discard_cookies=discard_cookies,
-                    _budget=controller.timeout(
-                        self.timeout if timeout is NOT_SET else timeout
-                    ),
-                    _connect_timeout=strategy.connect_timeout,
-                    _attempt_context=context,
-                    idle_timeout=idle_timeout,
-                )
+        rsp = None
+        terminal_error = None
+        try:
+            self._check_session_closed()
+            if idle_timeout is not None and (
+                not math.isfinite(idle_timeout) or idle_timeout <= 0
+            ):
+                raise ValueError("idle_timeout must be > 0")
+
+            body = content if content is not None else data
+            body_position = _capture_body_position(data, content)
+            strategy = self.retry if retry is None else _normalize_retry(retry)
+            controller.strategy = strategy
+            for _attempt in range(strategy.count + 1):
+                attempt_context = {
+                    "started": False,
+                    "send_state": SendState.NOT_STARTED,
+                    "controller": controller,
+                    "attempt": controller.attempts + 1,
+                }
+                if controller.remaining is not None and controller.remaining <= 0:
+                    raise controller.budget_error()
                 try:
-                    limit = controller.timeout(
-                        self.timeout if timeout is NOT_SET else timeout
+                    operation = self._request_once(
+                        method=method,
+                        url=url,
+                        params=params,
+                        data=data,
+                        content=content,
+                        json=json,
+                        headers=headers,
+                        cookies=cookies,
+                        files=files,
+                        auth=auth,
+                        timeout=timeout,
+                        allow_redirects=allow_redirects,
+                        max_redirects=max_redirects,
+                        proxies=proxies,
+                        proxy=proxy,
+                        proxy_auth=proxy_auth,
+                        verify=verify,
+                        referer=referer,
+                        accept_encoding=accept_encoding,
+                        content_callback=content_callback,
+                        impersonate=impersonate,
+                        ja3=ja3,
+                        akamai=akamai,
+                        perk=perk,
+                        extra_fp=extra_fp,
+                        default_headers=default_headers,
+                        default_encoding=default_encoding,
+                        quote=quote,
+                        http_version=http_version,
+                        interface=interface,
+                        dns=dns,
+                        doh_url=doh_url,
+                        cert=cert,
+                        stream=stream,
+                        max_recv_speed=max_recv_speed,
+                        multipart=multipart,
+                        discard_cookies=discard_cookies,
+                        _budget=controller.timeout(
+                            self.timeout if timeout is NOT_SET else timeout
+                        ),
+                        _connect_timeout=strategy.connect_timeout,
+                        _attempt_context=attempt_context,
+                        idle_timeout=idle_timeout,
                     )
-                    rsp = await asyncio.wait_for(operation, limit)
-                except asyncio.TimeoutError as cause:
-                    error = Timeout(
-                        "Request establishment/attempt deadline exceeded",
-                        code=28,
-                        send_state=context["send_state"],
+                    try:
+                        limit = controller.timeout(
+                            self.timeout if timeout is NOT_SET else timeout
+                        )
+                        rsp = await asyncio.wait_for(operation, limit)
+                    except asyncio.TimeoutError as cause:
+                        error = Timeout(
+                            "Request establishment/attempt deadline exceeded",
+                            code=28,
+                            send_state=attempt_context["send_state"],
+                        )
+                        raise error from cause
+                except BaseException as error:
+                    controller.request = attempt_context.get("request")
+                    controller.attempts += int(attempt_context["started"])
+                    if attempt_context["started"]:
+                        controller.notify(error=error)
+                    if not isinstance(error, Exception):
+                        raise
+                    delay = controller.retry_delay(
+                        error, body, body_position, multipart
                     )
-                    raise error from cause
-            except Exception as error:
-                controller.attempts += int(context["started"])
-                controller.notify(error=error)
-                delay = controller.retry_delay(error, body, body_position, multipart)
-                if delay is None:
-                    raise
-                if delay:
-                    await asyncio.sleep(delay)
-            else:
-                controller.attempts += int(context["started"])
-                controller.notify(response=rsp)
-                return rsp
+                    if delay is None:
+                        raise
+                    if delay:
+                        await asyncio.sleep(delay)
+                else:
+                    controller.attempts += int(attempt_context["started"])
+                    controller.request = rsp.request
+                    if attempt_context["started"]:
+                        controller.notify(response=rsp)
+                    return rsp
+        except BaseException as error:
+            terminal_error = error
+            raise
+        finally:
+            controller.complete(response=rsp, error=terminal_error)
 
     async def head(self, url: str, **kwargs: Unpack[RequestParams]) -> R:
         return await self.request(method="HEAD", url=url, **kwargs)

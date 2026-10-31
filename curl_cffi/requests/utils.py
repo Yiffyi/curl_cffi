@@ -755,7 +755,7 @@ def set_curl_options(
     # Add content-type if missing
     if json is not None:
         update_header_line(header_lines, "Content-Type", "application/json")
-    if content is None and isinstance(data, dict) and method != "POST":
+    if content is None and multipart is None and isinstance(data, (dict, list, tuple)):
         update_header_line(
             header_lines, "Content-Type", "application/x-www-form-urlencoded"
         )
@@ -773,7 +773,12 @@ def set_curl_options(
     else:
         existing_header_names = set()
 
-    req = Request(url, h, method, request_body)
+    prepared_headers = Headers(h)
+    for line in header_lines:
+        name, separator, value = line.partition(":")
+        if separator and name not in prepared_headers:
+            prepared_headers[name] = value.strip()
+    req = Request(url, prepared_headers, method, request_body)
 
     # cookies
     c.setopt(CurlOpt.COOKIEFILE, b"")  # always enable the curl cookie engine first

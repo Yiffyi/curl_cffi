@@ -26,7 +26,7 @@ def retry_server():
             if self.path == "/drop":
                 self.close_connection = True
                 return
-            if self.path == "/slow":
+            if self.path.split("?", 1)[0] == "/slow":
                 time.sleep(0.3)
             self.send_response(503 if self.path == "/status" else 200)
             if self.path.startswith("/stream"):
@@ -397,3 +397,179 @@ def test_seekable_upload_rewinds_after_partial_network_response(
             )
             assert rsp.content == b"operation"
     assert counts["uploaded"] == [b"operation", b"operation"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_observer_context_and_stream_establishment(retry_server, asynchronous):
+    url, _ = retry_server
+    events = []
+    metadata = object()
+
+    def attempt(info):
+        events.append(info)
+
+    def complete(info):
+        events.append(info)
+
+    def check(response):
+        assert len(events) == 2
+        first, final = events
+        assert first.request_context is final.request_context
+        assert final.request_context.context is metadata
+        assert final.request_context.url == url + "/stream-delayed"
+        assert final.request_context.stream
+        assert final.request is response.request
+        assert final.response is response
+        assert final.attempts == 1
+        assert final.error is None
+        assert response.content == b""
+
+    async def run():
+        async with AsyncSession(on_attempt=attempt, on_complete=complete) as session:
+            response = await session.get(
+                url + "/stream-delayed", stream=True, context=metadata
+            )
+            check(response)
+            await response.aclose()
+
+    if asynchronous:
+        asyncio.run(run())
+    else:
+        with Session(on_attempt=attempt, on_complete=complete) as session:
+            response = session.get(
+                url + "/stream-delayed", stream=True, context=metadata
+            )
+            check(response)
+            response.close()
+    assert len(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_observer_pool_wait_cancel_and_validation(retry_server):
+    url, _ = retry_server
+    attempts, completed = [], []
+    async with AsyncSession(
+        max_clients=1, on_attempt=attempts.append, on_complete=completed.append
+    ) as session:
+        curl = await session.pop_curl()
+        task = asyncio.create_task(session.get(url, context="waiting"))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert not attempts
+        assert len(completed) == 1
+        assert completed[0].error is caught.value
+        assert completed[0].attempts == 0
+        assert completed[0].request is None
+        session.release_curl(curl)
+        with pytest.raises(ValueError) as caught:
+            await session.get(url, idle_timeout=-1)
+        assert len(completed) == 2
+        assert completed[-1].error is caught.value
+        assert completed[-1].attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_observer_concurrent_context_and_prepared_failure(retry_server):
+    url, _ = retry_server
+    completed = []
+    async with AsyncSession(on_complete=completed.append, trust_env=False) as session:
+        await asyncio.gather(*(session.get(url, context=i) for i in range(3)))
+        assert {info.request_context.context for info in completed} == {0, 1, 2}
+        with pytest.raises(RequestException) as caught:
+            await session.get(
+                url + "/drop", retry=1, allow_replay=True, context="failed"
+            )
+        info = completed[-1]
+        assert info.error is caught.value
+        assert info.retry_info is caught.value.retry_info
+        assert info.attempts == 2
+        assert info.request.url == url + "/drop"
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (dict(json={"a": 1}), "application/json"),
+        (dict(data={"a": "1"}), "application/x-www-form-urlencoded"),
+    ],
+)
+def test_prepared_request_contains_inferred_headers(retry_server, payload, expected):
+    url, _ = retry_server
+    completed = []
+    with (
+        Session(on_complete=completed.append, trust_env=False) as session,
+        pytest.raises(RequestException),
+    ):
+        session.post(url, **payload)
+    request = completed[0].request
+    assert request.headers["Content-Type"] == expected
+    assert request.body
+
+
+@pytest.mark.asyncio
+async def test_complete_during_backoff_cancellation(retry_server):
+    url, _ = retry_server
+    attempted = asyncio.Event()
+    completed = []
+    async with AsyncSession(
+        trust_env=False,
+        on_attempt=lambda info: attempted.set(),
+        on_complete=completed.append,
+    ) as session:
+        task = asyncio.create_task(
+            session.get(
+                url + "/drop",
+                retry=RetryStrategy(count=2, delay=5),
+                allow_replay=True,
+            )
+        )
+        await attempted.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert len(completed) == 1
+        assert completed[0].attempts == 1
+        assert completed[0].error is caught.value
+        assert completed[0].request.url == url + "/drop"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_complete_hook_failure_preserves_response(retry_server, asynchronous):
+    url, _ = retry_server
+
+    def observer(info):
+        raise RuntimeError("observer failure")
+
+    async def run():
+        async with AsyncSession(on_complete=observer) as session:
+            return await session.get(url)
+
+    with pytest.warns(UserWarning, match="on_complete callback failed"):
+        if asynchronous:
+            response = asyncio.run(run())
+        else:
+            with Session(on_complete=observer) as session:
+                response = session.get(url)
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_attempt_deadline_retains_native_prepared_request(retry_server):
+    url, _ = retry_server
+    attempts, completed = [], []
+    async with AsyncSession(
+        on_attempt=attempts.append, on_complete=completed.append
+    ) as session:
+        with pytest.raises(Timeout) as caught:
+            await session.get(
+                url + "/slow",
+                params={"key": "value"},
+                retry=RetryStrategy(attempt_timeout=0.02),
+            )
+    assert len(attempts) == len(completed) == 1
+    assert attempts[0].error is completed[0].error is caught.value
+    assert attempts[0].request is completed[0].request
+    assert completed[0].request.url.endswith("/slow?key=value")
+    assert caught.value.__cause__ is not None

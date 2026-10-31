@@ -8,7 +8,7 @@ import time
 import warnings
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from collections.abc import Callable
 
 from ..curl import SendState
@@ -17,7 +17,7 @@ from .exceptions import HTTPError, RequestException, Timeout
 from .streams import _rewind_body
 
 if TYPE_CHECKING:
-    from .models import Response
+    from .models import Request, Response
 
 RetryBackoff = Literal["linear", "exponential"]
 RetryReason = Literal[
@@ -56,14 +56,50 @@ class RetryInfo:
 
 
 @dataclass(frozen=True)
+class RequestContext:
+    method: str
+    url: str
+    stream: bool
+    context: Any = None
+
+
+@dataclass(frozen=True)
 class AttemptInfo:
     attempt: int
     elapsed: float
+    request_context: RequestContext
     response: Response | None = None
-    error: Exception | None = None
+    error: BaseException | None = None
+    request: Request | None = None
+
+
+@dataclass(frozen=True)
+class CompleteInfo:
+    request_context: RequestContext
+    attempts: int
+    elapsed: float
+    response: Response | None = None
+    error: BaseException | None = None
+    request: Request | None = None
+    retry_info: RetryInfo | None = None
 
 
 AttemptCallback = Callable[[AttemptInfo], None]
+CompleteCallback = Callable[[CompleteInfo], None]
+
+
+def _notify(callback, event):
+    if callback is not None:
+        try:
+            callback(event)
+        except BaseException as exc:
+            name = "on_attempt" if isinstance(event, AttemptInfo) else "on_complete"
+            with suppress(Exception):
+                warnings.warn(
+                    f"{name} callback failed: {exc}",
+                    CurlCffiWarning,
+                    stacklevel=3,
+                )
 
 
 def normalize_retry(retry: int | RetryStrategy | None) -> RetryStrategy:
@@ -95,10 +131,15 @@ _TRANSIENT_CODES = frozenset({5, 6, 7, 16, 18, 28, 52, 55, 56, 81, 89, 92, 95, 9
 
 
 class _RetryController:
-    def __init__(self, strategy, allow_replay, on_attempt):
+    def __init__(
+        self, strategy, allow_replay, on_attempt, request_context, on_complete=None
+    ):
         self.strategy = strategy
         self.allow_replay = allow_replay
         self.on_attempt = on_attempt
+        self.on_complete = on_complete
+        self.request_context = request_context
+        self.request = None
         self.started = time.monotonic()
         self.attempts = 0
 
@@ -121,18 +162,31 @@ class _RetryController:
         return min(limits) if limits else None
 
     def notify(self, response=None, error=None):
-        if self.on_attempt is not None:
-            try:
-                self.on_attempt(
-                    AttemptInfo(self.attempts, self.elapsed, response, error)
-                )
-            except Exception as exc:
-                with suppress(Exception):
-                    warnings.warn(
-                        f"on_attempt callback failed: {exc}",
-                        CurlCffiWarning,
-                        stacklevel=2,
-                    )
+        _notify(
+            self.on_attempt,
+            AttemptInfo(
+                self.attempts,
+                self.elapsed,
+                self.request_context,
+                response,
+                error,
+                self.request,
+            ),
+        )
+
+    def complete(self, response=None, error=None):
+        _notify(
+            self.on_complete,
+            CompleteInfo(
+                self.request_context,
+                self.attempts,
+                self.elapsed,
+                response,
+                error,
+                self.request,
+                getattr(error, "retry_info", None),
+            ),
+        )
 
     def finish(self, error, reason):
         state = getattr(error, "send_state", SendState.UNKNOWN)

@@ -412,11 +412,30 @@ overall budget covers pool acquisition, attempts and backoff; each attempt and
 connection is capped independently. An attempt timeout in the policy overrides the
 legacy request/session timeout; without one, the legacy timeout remains the cap.
 
-An optional session/request ``on_attempt`` callback receives an ``AttemptInfo``
-with a one-based ``attempt`` number, cumulative ``elapsed``, and either the native
-``response`` or ``error``. A pool timeout has attempt number zero. Callback failures
-produce a warning and do not change the transfer result. The callback runs once
-when a stream is established, rather than again when that stream later finishes.
+Session and request ``on_attempt`` and ``on_complete`` callbacks receive frozen
+``AttemptInfo`` and ``CompleteInfo`` envelopes. Both include ``request_context``
+(original ``method``, ``url``, ``stream``, and opaque request ``context`` metadata),
+the native prepared ``request`` when available, and either ``response`` or
+``error``. Request metadata stays isolated across concurrent calls.
+``on_attempt`` runs once per actual library attempt with a one-based ``attempt``
+and cumulative ``elapsed``. A failure before acquiring a handle has no attempt
+event. ``on_complete`` runs exactly once with ``attempts``, cumulative ``elapsed``
+and terminal ``retry_info`` when available, including validation failures, pool
+waiting and cancellation. Error identity and causes are preserved.
+Callbacks are synchronous; failures produce a warning without changing the
+request result or retry decision. For streams, completion means establishment at
+final headers, without consuming the body; later body errors never emit a second
+completion event.
+
+.. code-block:: python
+
+    from curl_cffi.requests import AsyncSession
+
+    def completed(info):
+        print(info.request_context.context, info.attempts, info.elapsed)
+
+    async with AsyncSession(on_complete=completed) as session:
+        response = await session.get(url, context={"operation": "fetch"})
 
 Streaming opens when the final response headers are complete, without waiting for
 its first body chunk. Interim, followed redirect and proxy CONNECT headers do not
