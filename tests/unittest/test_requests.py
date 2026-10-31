@@ -236,7 +236,7 @@ def test_one_shot_content_redirect_is_unrewindable(server):
         )
 
 
-def test_seekable_content_rewinds_for_retry(server, tmp_path):
+def test_seekable_content_http_error_is_not_retried(server, tmp_path):
     path = tmp_path / "retry-body.bin"
     path.write_bytes(b"retry-file-body")
     url = server.url.copy_with(path="/retry_body", query=f"key={uuid4().hex}".encode())
@@ -244,9 +244,11 @@ def test_seekable_content_rewinds_for_retry(server, tmp_path):
     with (
         path.open("rb") as f,
         requests.Session(retry=1, raise_for_status=True) as session,
+        pytest.raises(HTTPError) as caught,
     ):
-        r = session.post(str(url), content=f)
-    assert r.content == b"retry-file-body"
+        session.post(str(url), content=f, allow_replay=True)
+    assert caught.value.response.content == b"retry-file-body"
+    assert caught.value.retry_info.reason == "deterministic_error"
 
 
 def test_one_shot_content_is_not_retried(server):
@@ -254,9 +256,9 @@ def test_one_shot_content_is_not_retried(server):
 
     with (
         requests.Session(retry=1, raise_for_status=True) as session,
-        pytest.raises(UnrewindableBodyError),
+        pytest.raises(HTTPError),
     ):
-        session.post(str(url), content=iter([b"important-body"]))
+        session.post(str(url), content=iter([b"important-body"]), allow_replay=True)
 
 
 def test_post_redirect_to_get(server):
@@ -679,9 +681,10 @@ def test_session_retry(server):
         server.url.copy_with(path="/retry_once", query=f"key={retry_key}".encode())
     )
     with requests.Session(retry=1, raise_for_status=True) as s:
-        r = s.get(retry_url)
-    assert r.status_code == 200
-    assert r.content == b"ok"
+        with pytest.raises(HTTPError) as caught:
+            s.get(retry_url, allow_replay=True)
+        assert caught.value.retry_info.attempts == 1
+        assert caught.value.retry_info.reason == "deterministic_error"
 
 
 def test_post_timeout(server):
@@ -1328,7 +1331,9 @@ def test_stream_metadata_stays_in_transfer_thread(server, monkeypatch, method):
     release_transfer = Event()
     transfer_finished = Event()
     transfer_thread = None
-    original_perform = Curl.perform
+    from curl_cffi.requests import session as session_module
+
+    original_perform = session_module._perform_sync_stream
     original_getinfo = Curl.getinfo
 
     def perform(curl, *args, **kwargs):
@@ -1346,7 +1351,7 @@ def test_stream_metadata_stays_in_transfer_thread(server, monkeypatch, method):
         assert get_ident() == transfer_thread
         return original_getinfo(curl, option)
 
-    monkeypatch.setattr(Curl, "perform", perform)
+    monkeypatch.setattr(session_module, "_perform_sync_stream", perform)
     monkeypatch.setattr(Curl, "getinfo", getinfo)
     with requests.Session() as session:
         try:

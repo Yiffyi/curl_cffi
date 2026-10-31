@@ -15,7 +15,6 @@ from curl_cffi.requests.exceptions import (
     CertificateVerifyError,
     HTTPError,
     TooManyRedirects,
-    UnrewindableBodyError,
 )
 from curl_cffi.requests.models import Response
 
@@ -153,8 +152,9 @@ async def test_one_shot_async_content_is_not_retried(server):
 
     url = server.url.copy_with(path="/retry_body", query=f"key={uuid4().hex}".encode())
     async with AsyncSession(retry=1, raise_for_status=True) as s:
-        with pytest.raises(UnrewindableBodyError):
-            await s.post(str(url), content=content())
+        with pytest.raises(HTTPError) as caught:
+            await s.post(str(url), content=content(), allow_replay=True)
+        assert caught.value.retry_info.reason == "deterministic_error"
 
 
 async def test_put_json(server):

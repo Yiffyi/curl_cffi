@@ -108,6 +108,7 @@ def test_upload_multiple_files_different_name(file_server):
 
 def test_addpart_data_failure_raises(monkeypatch):
     mock_lib = Mock(wraps=lib)
+    mock_lib.prereq_function = lib.prereq_function
     mock_lib.curl_mime_data.return_value = CurlECode.OUT_OF_MEMORY
     monkeypatch.setattr("curl_cffi.curl.lib", mock_lib)
     multipart = CurlMime()

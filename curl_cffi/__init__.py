@@ -4,6 +4,7 @@ __all__ = [
     "CurlMime",
     "CurlShare",
     "CurlError",
+    "SendState",
     "CurlInfo",
     "CurlOpt",
     "CurlMOpt",
@@ -79,7 +80,7 @@ from .const import (
     CurlWsFlag,
     CurlWsOption,
 )
-from .curl import Curl, CurlError, CurlMime, CurlShare
+from .curl import Curl, CurlError, CurlMime, CurlShare, SendState
 
 from .requests import (
     AsyncSession,

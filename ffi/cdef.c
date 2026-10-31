@@ -92,3 +92,7 @@ int curl_mime_type(void *field, char *type);
 int curl_mime_filename(void *field, char *filename);
 int curl_mime_filedata(void *field, char *filename);
 void curl_mime_free(void *form);
+
+extern "Python" int prereq_function(void *clientp, char *primary_ip, char *local_ip, int primary_port, int local_port);
+
+extern "Python" int xferinfo_function(void *clientp, int64_t dltotal, int64_t dlnow, int64_t ultotal, int64_t ulnow);

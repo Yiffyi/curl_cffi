@@ -118,7 +118,8 @@ def download_libcurl():
         print(f"libcurl-impersonate: {expected} already downloaded.")
         return
 
-    file = "libcurl-impersonate.tar.gz"
+    os.makedirs(libdir, exist_ok=True)
+    file = str(libdir / "libcurl-impersonate.tar.gz")
     sysname = "linux-" + arch["libc"] if arch["system"] == "Linux" else arch["sysname"]
 
     url = (

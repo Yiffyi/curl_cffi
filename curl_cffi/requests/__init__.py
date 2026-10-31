@@ -26,6 +26,9 @@ __all__ = [
     "WsCloseCode",
     "ExtraFingerprints",
     "RetryStrategy",
+    "RetryInfo",
+    "AttemptInfo",
+    "SendState",
     "CacheBackend",
     "FileCacheBackend",
     "CookieTypes",
@@ -36,6 +39,8 @@ __all__ = [
 from typing import Optional, TYPE_CHECKING, TypedDict
 
 from ..const import CurlWsFlag
+from ..curl import SendState
+from .retry import AttemptInfo, RetryInfo
 from .cache import CacheBackend, FileCacheBackend
 from .cookies import Cookies, CookieTypes
 from .errors import RequestsError

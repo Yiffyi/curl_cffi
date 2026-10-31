@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import suppress
 import queue
 import re
@@ -432,8 +433,13 @@ class Response:
     async def aclose(self):
         """Close the streaming connection, only valid in stream mode."""
 
+        if self.quit_now:
+            self.quit_now.set()
         if self.astream_task:
-            await self.astream_task
+            if not self.astream_task.done():
+                self.astream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.astream_task
 
     # It prints the status code of the response instead of the object's memory location.
     def __repr__(self) -> str:

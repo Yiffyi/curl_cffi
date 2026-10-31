@@ -372,3 +372,69 @@ retrying cleanup.
 
 ``CurlShare`` can also share the connection cache (``CurlShare(connect=True)``), but that
 is only safe when the handles are used serially, never from multiple concurrent threads.
+
+Observed retries and request budgets
+-----------------------------------
+
+``RetryStrategy.count`` is the number of additional Python attempts, so ``count=2``
+permits three attempts including the initial request. A request can override its
+session's immutable policy without changing the shared session::
+
+    from curl_cffi.requests import AsyncSession, RetryStrategy
+
+    policy = RetryStrategy(
+        count=2, delay=0.2, jitter=0.1, backoff="exponential",
+        connect_timeout=5, attempt_timeout=30, total_timeout=60,
+    )
+    async with AsyncSession(retry=policy) as session:
+        response = await session.get("https://example.com/")
+        response = await session.post(
+            "https://example.com/operation", content=b"operation",
+            retry=RetryStrategy(count=0), allow_replay=False,
+        )
+
+Only transient native network errors can trigger another attempt. By default,
+this requires ``error.send_state == SendState.NOT_STARTED``. The public
+``SendState`` enum also contains ``POSSIBLY_SENT`` and ``UNKNOWN``. For either of
+these states, another attempt requires explicit ``allow_replay=True`` and a body
+that can be rewound or regenerated. Full HTTP status errors (including 429 and
+503), deterministic configuration/certificate errors, and cancellation do not
+trigger generic retries. libcurl may still recover a connection internally; those
+recoveries are not additional Python attempts and do not provide exactly-once
+server processing.
+
+The final native exception retains its original type and cause and exposes an
+immutable ``retry_info`` with ``attempts``, ``elapsed``, ``send_state`` and
+``reason``. Reasons are ``attempts_exhausted``, ``budget_exhausted``,
+``replay_forbidden``, ``deterministic_error`` and ``body_not_replayable``. A pool
+queue timeout can exhaust the overall budget with zero network attempts. The
+overall budget covers pool acquisition, attempts and backoff; each attempt and
+connection is capped independently. An attempt timeout in the policy overrides the
+legacy request/session timeout; without one, the legacy timeout remains the cap.
+
+An optional session/request ``on_attempt`` callback receives an ``AttemptInfo``
+with a one-based ``attempt`` number, cumulative ``elapsed``, and either the native
+``response`` or ``error``. A pool timeout has attempt number zero. Callback failures
+produce a warning and do not change the transfer result. The callback runs once
+when a stream is established, rather than again when that stream later finishes.
+
+Streaming opens when the final response headers are complete, without waiting for
+its first body chunk. Interim, followed redirect and proxy CONNECT headers do not
+open it. Establishment is covered by the policy budget; an opened stream has no
+fixed completion deadline. ``idle_timeout`` optionally limits inactivity after
+opening. It measures received response-body bytes before decompression, separately
+from consumer queue reads; heartbeat and compressed ingress refresh it while a
+consumer is paused. An idle/transport failure after opening carries
+``retry_info.reason == "stream_interrupted"`` and is never automatically replayed.
+Sync and async stream close interrupt a silent transfer and release its handle.
+
+The low-level ``CurlOpt.PREREQFUNCTION`` accepts a callback with primary/local IP
+bytes and primary/local ports, returning libcurl's native 0 (continue) or 1
+(abort). Automatic observation records ``POSSIBLY_SENT`` before invoking it and
+never aborts. It remains set across internal reconnects and redirects until reset.
+The native ``CurlError.send_state`` snapshot survives handle reset/close. It does
+not prove whether a server processed the request. Callback contexts stay alive
+until native reset/cleanup completes, including debug events during cancellation.
+``CurlOpt.XFERINFOFUNCTION`` accepts libcurl's four transfer counters and uses the
+same callback ownership. ``CurlOpt.CONNECT_TO`` supports string/byte slist entries
+and keeps the URL, Host and TLS target identity intact.

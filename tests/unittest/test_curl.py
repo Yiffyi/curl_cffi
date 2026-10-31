@@ -144,6 +144,9 @@ def test_write_function_memory_leak(server):
         buffer = BytesIO()
         c.setopt(CurlOpt.WRITEDATA, buffer)
         c.perform()
+    # Native callbacks retain their context until native reset/cleanup completes.
+    assert c._write_handle is not None
+    c.reset()
     assert c._write_handle is None
 
 

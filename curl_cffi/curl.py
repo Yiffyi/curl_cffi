@@ -8,6 +8,7 @@ import struct
 import sys
 import threading
 import warnings
+from enum import Enum
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -58,6 +59,14 @@ if TYPE_CHECKING:
         len: int
 
 
+class SendState(str, Enum):
+    """Conservative target request observation, never proof of server processing."""
+
+    NOT_STARTED = "not_started"
+    POSSIBLY_SENT = "possibly_sent"
+    UNKNOWN = "unknown"
+
+
 class CurlError(Exception):
     """Base exception for curl_cffi package"""
 
@@ -68,6 +77,8 @@ class CurlError(Exception):
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        self.send_state = kwargs.pop("send_state", SendState.UNKNOWN)
+        self.retry_info = kwargs.pop("retry_info", None)
         super().__init__(msg, *args, **kwargs)
         self.code: int | CurlECode | Literal[0] = code
 
@@ -130,6 +141,21 @@ def debug_function(curl, type_: int, data, size: int, clientp) -> int:
     text = ffi.buffer(data, size)[:]
     callback(type_, text)
     return 0
+
+
+@ffi.def_extern(onerror=_store_callback_error(1))
+def prereq_function(clientp, primary_ip, local_ip, primary_port, local_port):
+    """Public CURLOPT_PREREQFUNCTION binding."""
+    context = ffi.from_handle(clientp)
+    return context.callback(
+        ffi.string(primary_ip), ffi.string(local_ip), primary_port, local_port
+    )
+
+
+@ffi.def_extern(onerror=_store_callback_error(1))
+def xferinfo_function(clientp, dltotal, dlnow, ultotal, ulnow):
+    context = ffi.from_handle(clientp)
+    return context.callback(dltotal, dlnow, ultotal, ulnow)
 
 
 def bytes_to_hex(b: bytes, uppercase: bool = False) -> str:
@@ -307,12 +333,16 @@ class Curl:
         self._ws_headers = ffi.NULL
         self._proxy_headers = ffi.NULL
         self._resolve = ffi.NULL
+        self._connect_to = ffi.NULL
         self._cacert = cacert or DEFAULT_CACERT
         self._is_cert_set = False
         self._skip_cacert = False
         self._write_handle: Any = None
         self._header_handle: Any = None
         self._debug_handle: Any = None
+        self._prereq_handle: Any = None
+        self._xferinfo_handle: Any = None
+        self.send_state = SendState.NOT_STARTED
         self._body_handle: Any = None
         self._read_handle: Any = None
         self._seek_handle: Any = None
@@ -321,6 +351,7 @@ class Curl:
         self._debug = debug
         self._share: CurlShare | None = None
         self._set_error_buffer()
+        self.setopt(CurlOpt.PREREQFUNCTION, lambda *args: 0)
 
         # Pre-allocated CFFI objects for WebSocket performance
         self._ws_recv_buffer: object | None = None
@@ -367,6 +398,7 @@ class Curl:
                 "See https://curl.se/libcurl/c/libcurl-errors.html first for more "
                 "details.",
                 code=cast(CurlECode, errcode),
+                send_state=self.send_state,
             )
 
     def _get_callback_exception(self) -> BaseException | None:
@@ -374,6 +406,8 @@ class Curl:
             self._write_handle,
             self._header_handle,
             self._debug_handle,
+            self._prereq_handle,
+            self._xferinfo_handle,
             self._read_handle,
             self._seek_handle,
         ):
@@ -451,6 +485,22 @@ class Curl:
             self._read_handle = c_value
             lib._curl_easy_setopt(self._curl, CurlOpt.READFUNCTION, lib.read_callback)
             option = CurlOpt.READDATA
+        elif option == CurlOpt.XFERINFOFUNCTION:
+            c_value = ffi.new_handle(_CallbackContext(value))
+            self._xferinfo_handle = c_value
+            lib._curl_easy_setopt(self._curl, option, lib.xferinfo_function)
+            option = CurlOpt.XFERINFODATA
+        elif option == CurlOpt.PREREQFUNCTION:
+            callback = value
+
+            def observe(*args):
+                self.send_state = SendState.POSSIBLY_SENT
+                return callback(*args)
+
+            c_value = ffi.new_handle(_CallbackContext(observe))
+            self._prereq_handle = c_value
+            lib._curl_easy_setopt(self._curl, option, lib.prereq_function)
+            option = CurlOpt.PREREQDATA
         elif option == CurlOpt.DEBUGFUNCTION:
             if value is True:
                 value = debug_function_default
@@ -511,12 +561,15 @@ class Curl:
                     self._proxy_headers, proxy_header
                 )
             ret = lib._curl_easy_setopt(self._curl, option, self._proxy_headers)
-        elif option == CurlOpt.RESOLVE:
-            for resolve in value:
-                if isinstance(resolve, str):
-                    resolve = resolve.encode()
-                self._resolve = lib.curl_slist_append(self._resolve, resolve)
-            ret = lib._curl_easy_setopt(self._curl, option, self._resolve)
+        elif option in (CurlOpt.RESOLVE, CurlOpt.CONNECT_TO):
+            attr = "_resolve" if option == CurlOpt.RESOLVE else "_connect_to"
+            entries = getattr(self, attr)
+            for entry in value:
+                if isinstance(entry, str):
+                    entry = entry.encode()
+                entries = lib.curl_slist_append(entries, entry)
+            setattr(self, attr, entries)
+            ret = lib._curl_easy_setopt(self._curl, option, entries)
         else:
             ret = lib._curl_easy_setopt(self._curl, option, c_value)
         self._check_error(ret, "setopt", option, value)
@@ -653,17 +706,15 @@ class Curl:
     ) -> None:
         """Clean up handles and buffers after ``perform`` and ``close``,
         called at the end of ``perform`` and ``close``."""
-        self._write_handle = None
-        self._header_handle = None
-        self._debug_handle = None
-        self._body_handle = None
-        self._read_handle = None
-        self._seek_handle = None
+        # Native options still reference callbacks until reset/cleanup. In particular,
+        # removing an active multi handle and closing connections can emit debug data.
 
         if clear_resolve:
-            if self._resolve != ffi.NULL:
-                lib.curl_slist_free_all(self._resolve)
-            self._resolve = ffi.NULL
+            for attr in ("_resolve", "_connect_to"):
+                entries = getattr(self, attr)
+                if entries != ffi.NULL:
+                    lib.curl_slist_free_all(entries)
+                setattr(self, attr, ffi.NULL)
 
         if clear_headers:
             header_attrs = (
@@ -699,7 +750,11 @@ class Curl:
         self._skip_cacert = False
         if self._curl is not None:
             lib.curl_easy_reset(self._curl)
+            self._clear_callback_handles()
+            self.clean_handles_and_buffers()
+            self.send_state = SendState.NOT_STARTED
             self._set_error_buffer()
+            self.setopt(CurlOpt.PREREQFUNCTION, lambda *args: 0)
         self._resolve = ffi.NULL
 
     def parse_cookie_headers(self, headers: list[bytes]) -> SimpleCookie:
@@ -747,13 +802,23 @@ class Curl:
 
         return http_version, status_code, reason
 
+    def _clear_callback_handles(self) -> None:
+        self._write_handle = None
+        self._header_handle = None
+        self._debug_handle = None
+        self._prereq_handle = None
+        self._xferinfo_handle = None
+        self._body_handle = None
+        self._read_handle = None
+        self._seek_handle = None
+
     def close(self) -> None:
         """Close and cleanup curl handle, wrapper for ``curl_easy_cleanup``."""
-        self.clean_handles_and_buffers()
-
         if self._curl:
             lib.curl_easy_cleanup(self._curl)
             self._curl = None
+        self._clear_callback_handles()
+        self.clean_handles_and_buffers()
         if self._share is not None:
             # Cyclic GC may finalize the share before its attached handles.
             if self._share._finalizing:

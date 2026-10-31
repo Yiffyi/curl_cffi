@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import http.cookies
+import math
 import os
 import queue
-import random
 import sys
 import threading
 import time
@@ -17,7 +17,6 @@ from collections.abc import (
 )
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, suppress
-from dataclasses import dataclass
 from datetime import timedelta
 from io import BytesIO
 from typing import (
@@ -36,7 +35,7 @@ from weakref import WeakSet
 
 from ..aio import AsyncCurl
 from ..const import CurlFollow, CurlHttpVersion, CurlInfo, CurlOpt
-from ..curl import Curl, CurlError, CurlMime, CurlShare
+from ..curl import Curl, CurlError, CurlMime, CurlShare, SendState
 from ..utils import CurlCffiWarning
 from .cache import CacheBackend, CacheSpec, normalize_cache_backend
 from .cookies import Cookies, CookieTypes
@@ -44,20 +43,29 @@ from .exceptions import (
     RequestException,
     SessionClosed,
     code2error,
+    Timeout,
 )
 from .headers import Headers, HeaderTypes
 from .impersonate import BrowserTypeLiteral, ExtraFingerprints, ExtraFpDict
 from .models import Response
+from .retry import (
+    AttemptCallback,
+    RetryStrategy,
+    RetryInfo,
+    _RetryController,
+    normalize_retry as _normalize_retry,
+)
 from .streams import (
     STREAM_END,
     RequestContent,
     RequestData,
     SyncRequestContent,
     _AsyncIterableReader,
+    _perform_sync_stream,
+    _watch_stream,
     _capture_body_position,
     _peek_aio_queue,
     _peek_queue,
-    _rewind_body,
 )
 from .utils import NOT_SET, HttpVersionLiteral, NotSetType, set_curl_options
 from .websockets import (
@@ -105,6 +113,7 @@ if TYPE_CHECKING:
         allow_redirects: Union[bool, CurlFollow, str]
         max_redirects: int
         retry: Union[int, RetryStrategy]
+        on_attempt: Optional[AttemptCallback]
         impersonate: Optional[Union[BrowserTypeLiteral, str, Fingerprint]]
         ja3: Optional[str]
         akamai: Optional[str]
@@ -163,6 +172,10 @@ if TYPE_CHECKING:
 
     class RequestParams(StreamRequestParams, total=False):
         stream: Optional[bool]
+        retry: Optional[Union[int, RetryStrategy]]
+        allow_replay: bool
+        idle_timeout: Optional[float]
+        on_attempt: Optional[AttemptCallback]
 
 else:
 
@@ -189,37 +202,6 @@ def _is_absolute_url(url: str) -> bool:
     return bool(parsed_url.scheme and parsed_url.hostname)
 
 
-RetryBackoff = Literal["linear", "exponential"]
-
-
-@dataclass
-class RetryStrategy:
-    count: int
-    delay: float = 0.0
-    jitter: float = 0.0
-    backoff: RetryBackoff = "linear"
-
-
-def _normalize_retry(retry: Optional[Union[int, RetryStrategy]]) -> RetryStrategy:
-    if retry is None:
-        retry = 0
-    if isinstance(retry, RetryStrategy):
-        strategy = retry
-    elif isinstance(retry, int):
-        strategy = RetryStrategy(count=retry)
-    else:
-        raise TypeError("retry must be an int or RetryStrategy")
-    if strategy.count < 0:
-        raise ValueError("retry.count must be >= 0")
-    if strategy.delay < 0:
-        raise ValueError("retry.delay must be >= 0")
-    if strategy.jitter < 0:
-        raise ValueError("retry.jitter must be >= 0")
-    if strategy.backoff not in ("linear", "exponential"):
-        raise ValueError("retry.backoff must be 'linear' or 'exponential'")
-    return strategy
-
-
 class BaseSession(Generic[R]):
     """Provide common methods for setting curl options and reading info in sessions."""
 
@@ -240,6 +222,7 @@ class BaseSession(Generic[R]):
         allow_redirects: Union[bool, CurlFollow, str] = True,
         max_redirects: int = 30,
         retry: Optional[Union[int, RetryStrategy]] = 0,
+        on_attempt: Optional[AttemptCallback] = None,
         impersonate: Optional[Union[BrowserTypeLiteral, str, Fingerprint]] = None,
         ja3: Optional[str] = None,
         akamai: Optional[str] = None,
@@ -271,6 +254,7 @@ class BaseSession(Generic[R]):
         self.allow_redirects = allow_redirects
         self.max_redirects = max_redirects
         self.retry = _normalize_retry(retry)
+        self.on_attempt = on_attempt
         self.impersonate = impersonate
         self.ja3 = ja3
         self.akamai = akamai
@@ -323,6 +307,21 @@ class BaseSession(Generic[R]):
         if self._share is not None:
             curl.setopt(CurlOpt.SHARE, self._share._curl_share)
             curl._share = self._share  # keep the share alive while in use
+
+    def _parse_error_response(
+        self, curl, buffer, header_buffer, default_encoding, discard_cookies
+    ):
+        try:
+            return self._parse_response(
+                curl, buffer, header_buffer, default_encoding, discard_cookies
+            )
+        except CurlError:
+            # A malformed URL can leave EFFECTIVE_URL unavailable. Never replace
+            # its original native error with a secondary getinfo failure.
+            rsp = self.response_class(curl)
+            rsp.status_code = 0
+            rsp.ok = False
+            return rsp
 
     def _parse_response(
         self,
@@ -470,15 +469,20 @@ class BaseSession(Generic[R]):
             )
         )
 
-    def _retry_delay(self, attempt: int) -> float:
-        strategy = self.retry
-        if strategy.backoff == "exponential":
-            delay = strategy.delay * (2 ** (attempt - 1))
-        else:
-            delay = strategy.delay * attempt
-        if strategy.jitter:
-            delay += random.uniform(0.0, strategy.jitter)
-        return delay
+    @staticmethod
+    def _set_request_limits(curl, budget, connect_timeout, stream):
+        if budget is not None:
+            curl.setopt(CurlOpt.TIMEOUT_MS, max(1, math.ceil(budget * 1000)))
+        if connect_timeout is not None:
+            if budget is not None:
+                connect_timeout = min(connect_timeout, budget)
+            curl.setopt(
+                CurlOpt.CONNECTTIMEOUT_MS, max(1, math.ceil(connect_timeout * 1000))
+            )
+        if stream:
+            # Strict idle reception is separate from average transfer speed.
+            curl.setopt(CurlOpt.LOW_SPEED_LIMIT, 0)
+            curl.setopt(CurlOpt.LOW_SPEED_TIME, 0)
 
     @property
     def cache_backend(self) -> Optional[CacheBackend]:
@@ -900,6 +904,10 @@ class Session(BaseSession[R]):
         max_recv_speed: int = 0,
         multipart: Optional[CurlMime] = None,
         discard_cookies: bool = False,
+        _budget: Optional[float] = None,
+        _connect_timeout: Optional[float] = None,
+        _attempt_context: Optional[dict] = None,
+        idle_timeout: Optional[float] = None,
     ) -> R:
         # clone a new curl instance for streaming response
         if stream:
@@ -908,7 +916,20 @@ class Session(BaseSession[R]):
         else:
             c = self.curl
 
+        if _attempt_context is not None:
+            _attempt_context["started"] = True
+        activity = [None]
+
+        def receive_activity():
+            activity[0] = time.monotonic()
+
+        stream_opened = False
         stream_response: Optional[R] = None
+
+        def mark_stream_opened() -> None:
+            nonlocal stream_opened
+            parse_stream_response()
+            stream_opened = True
 
         def parse_stream_response() -> None:
             nonlocal stream_response
@@ -916,56 +937,66 @@ class Session(BaseSession[R]):
                 c, buffer, header_buffer, default_encoding, discard_cookies
             )
 
-        req, buffer, header_buffer, q, header_recved, quit_now = set_curl_options(
-            c,
-            method=method,
-            url=url,
-            params_list=[self.params, params],
-            base_url=self.base_url,
-            data=data,
-            content=content,
-            json=json,
-            headers_list=[self.headers, headers],
-            cookies_list=[self._cookies, cookies],
-            files=files,
-            auth=auth or self.auth,
-            timeout=self.timeout if timeout is NOT_SET else timeout,
-            allow_redirects=(
-                self.allow_redirects if allow_redirects is None else allow_redirects
-            ),
-            max_redirects=(
-                self.max_redirects if max_redirects is None else max_redirects
-            ),
-            proxies_list=[self.proxies, proxies],
-            proxy=proxy,
-            proxy_auth=proxy_auth or self.proxy_auth,
-            trust_env=self.trust_env,
-            verify_list=[self.verify, verify],
-            referer=referer,
-            accept_encoding=accept_encoding,
-            content_callback=content_callback,
-            impersonate=impersonate or self.impersonate,
-            ja3=ja3 or self.ja3,
-            akamai=akamai or self.akamai,
-            perk=perk or self.perk,
-            extra_fp=extra_fp or self.extra_fp,
-            default_headers=(
-                self.default_headers if default_headers is None else default_headers
-            ),
-            quote=quote,
-            http_version=http_version or self.http_version,
-            interface=interface or self.interface,
-            dns=self.dns if dns is None else dns,
-            doh_url=doh_url or self.doh_url,
-            stream=stream,
-            stream_response_callback=parse_stream_response if stream else None,
-            max_recv_speed=max_recv_speed,
-            multipart=multipart,
-            cert=cert or self.cert,
-            curl_options=self.curl_options,
-            queue_class=queue.Queue,
-            event_class=threading.Event,
-        )
+        try:
+            req, buffer, header_buffer, q, header_recved, quit_now = set_curl_options(
+                c,
+                method=method,
+                url=url,
+                params_list=[self.params, params],
+                base_url=self.base_url,
+                data=data,
+                content=content,
+                json=json,
+                headers_list=[self.headers, headers],
+                cookies_list=[self._cookies, cookies],
+                files=files,
+                auth=auth or self.auth,
+                timeout=self.timeout if timeout is NOT_SET else timeout,
+                allow_redirects=(
+                    self.allow_redirects if allow_redirects is None else allow_redirects
+                ),
+                max_redirects=(
+                    self.max_redirects if max_redirects is None else max_redirects
+                ),
+                proxies_list=[self.proxies, proxies],
+                proxy=proxy,
+                proxy_auth=proxy_auth or self.proxy_auth,
+                trust_env=self.trust_env,
+                verify_list=[self.verify, verify],
+                referer=referer,
+                accept_encoding=accept_encoding,
+                content_callback=content_callback,
+                impersonate=impersonate or self.impersonate,
+                ja3=ja3 or self.ja3,
+                akamai=akamai or self.akamai,
+                perk=perk or self.perk,
+                extra_fp=extra_fp or self.extra_fp,
+                default_headers=(
+                    self.default_headers if default_headers is None else default_headers
+                ),
+                quote=quote,
+                http_version=http_version or self.http_version,
+                interface=interface or self.interface,
+                dns=self.dns if dns is None else dns,
+                doh_url=doh_url or self.doh_url,
+                stream=stream,
+                stream_response_callback=mark_stream_opened if stream else None,
+                stream_activity=receive_activity if stream else None,
+                max_recv_speed=max_recv_speed,
+                multipart=multipart,
+                cert=cert or self.cert,
+                curl_options=self.curl_options,
+                queue_class=queue.Queue,
+                event_class=threading.Event,
+            )
+
+            self._set_request_limits(c, _budget, _connect_timeout, stream)
+        except BaseException:
+            if stream:
+                c.close()
+            else:
+                c.reset()
+            raise
 
         if self._cache_enabled(req, stream=stream, content_callback=content_callback):
             cached_response = self._cache.get(
@@ -984,14 +1015,26 @@ class Session(BaseSession[R]):
 
             def perform():
                 try:
-                    c.perform()
+                    _perform_sync_stream(c, quit_now, idle_timeout, activity)
                 except CurlError as e:
-                    rsp = self._parse_response(
+                    rsp = self._parse_error_response(
                         c, buffer, header_buffer, default_encoding, discard_cookies
                     )
                     rsp.request = req
                     error = code2error(e.code, str(e))
-                    q.put_nowait(error(str(e), e.code, rsp))  # type: ignore
+                    exception = error(str(e), e.code, rsp, send_state=e.send_state)
+                    exception.__cause__ = e
+                    if stream_opened and _attempt_context is not None:
+                        controller = _attempt_context["controller"]
+                        exception.retry_info = RetryInfo(
+                            _attempt_context["attempt"],
+                            controller.elapsed,
+                            e.send_state,
+                            "stream_interrupted",
+                        )
+                    q.put_nowait(exception)  # type: ignore
+                except asyncio.CancelledError:
+                    pass
                 finally:
                     try:
                         if stream_response is None:
@@ -1013,7 +1056,7 @@ class Session(BaseSession[R]):
 
             # Raise the exception if something wrong happens when receiving the header.
             first_element = _peek_queue(q)  # type: ignore
-            if isinstance(first_element, RequestException):
+            if isinstance(first_element, RequestException) and not stream_opened:
                 if quit_now:
                     quit_now.set()
                 stream_task.result()
@@ -1025,7 +1068,11 @@ class Session(BaseSession[R]):
             rsp.quit_now = quit_now
             rsp.queue = q
             if self.raise_for_status:
-                rsp.raise_for_status()
+                try:
+                    rsp.raise_for_status()
+                except RequestException:
+                    rsp.close()
+                    raise
             return rsp
         else:
             try:
@@ -1042,12 +1089,12 @@ class Session(BaseSession[R]):
                 else:
                     c.perform()
             except CurlError as e:
-                rsp = self._parse_response(
+                rsp = self._parse_error_response(
                     c, buffer, header_buffer, default_encoding, discard_cookies
                 )
                 rsp.request = req
                 error = code2error(e.code, str(e))
-                raise error(str(e), e.code, rsp) from e
+                raise error(str(e), e.code, rsp, send_state=e.send_state) from e
             else:
                 rsp = self._parse_response(
                     c, buffer, header_buffer, default_encoding, discard_cookies
@@ -1061,6 +1108,8 @@ class Session(BaseSession[R]):
                     rsp.raise_for_status()
                 return rsp
             finally:
+                if _attempt_context is not None:
+                    _attempt_context["send_state"] = c.send_state
                 c.reset()
 
     def request(
@@ -1102,19 +1151,36 @@ class Session(BaseSession[R]):
         max_recv_speed: int = 0,
         multipart: Optional[CurlMime] = None,
         discard_cookies: bool = False,
+        retry: Optional[Union[int, RetryStrategy]] = None,
+        allow_replay: bool = False,
+        idle_timeout: Optional[float] = None,
+        on_attempt: Optional[AttemptCallback] = None,
     ) -> R:
         """Send the request, see ``requests.request`` for details on parameters."""
 
         self._check_session_closed()
+        if idle_timeout is not None and (
+            not math.isfinite(idle_timeout) or idle_timeout <= 0
+        ):
+            raise ValueError("idle_timeout must be > 0")
 
         body = content if content is not None else data
         body_position = _capture_body_position(data, content)
-        strategy = self.retry
-        for attempt in range(strategy.count + 1):
-            if attempt > 0:
-                _rewind_body(body, body_position)
+        strategy = self.retry if retry is None else _normalize_retry(retry)
+        controller = _RetryController(
+            strategy, allow_replay, on_attempt or self.on_attempt
+        )
+        for _attempt in range(strategy.count + 1):
+            context = {
+                "started": False,
+                "send_state": SendState.NOT_STARTED,
+                "controller": controller,
+                "attempt": controller.attempts + 1,
+            }
+            if controller.remaining is not None and controller.remaining <= 0:
+                raise controller.budget_error()
             try:
-                return self._request_once(
+                rsp = self._request_once(
                     method=method,
                     url=url,
                     params=params,
@@ -1152,13 +1218,25 @@ class Session(BaseSession[R]):
                     max_recv_speed=max_recv_speed,
                     multipart=multipart,
                     discard_cookies=discard_cookies,
+                    _budget=controller.timeout(
+                        self.timeout if timeout is NOT_SET else timeout
+                    ),
+                    _connect_timeout=strategy.connect_timeout,
+                    _attempt_context=context,
+                    idle_timeout=idle_timeout,
                 )
-            except RequestException:
-                if attempt == strategy.count:
+            except Exception as error:
+                controller.attempts += int(context["started"])
+                controller.notify(error=error)
+                delay = controller.retry_delay(error, body, body_position, multipart)
+                if delay is None:
                     raise
-                delay = self._retry_delay(attempt + 1)
                 if delay:
                     time.sleep(delay)
+            else:
+                controller.attempts += int(context["started"])
+                controller.notify(response=rsp)
+                return rsp
 
     def head(self, url: str, **kwargs: Unpack[RequestParams]) -> R:
         return self.request(method="HEAD", url=url, **kwargs)
@@ -1402,7 +1480,6 @@ class AsyncSession(BaseSession[R]):
                 self.push_curl(curl)
 
     def release_curl(self, curl: Curl) -> None:
-        curl.clean_handles_and_buffers()
         if not self._closed:
             self.acurl.remove_handle(curl)
             curl.reset()
@@ -1724,10 +1801,26 @@ class AsyncSession(BaseSession[R]):
         max_recv_speed: int = 0,
         multipart: Optional[CurlMime] = None,
         discard_cookies: bool = False,
+        _budget: Optional[float] = None,
+        _connect_timeout: Optional[float] = None,
+        _attempt_context: Optional[dict] = None,
+        idle_timeout: Optional[float] = None,
     ) -> R:
         curl = await self.pop_curl()
+        if _attempt_context is not None:
+            _attempt_context["started"] = True
         async_reader: _AsyncIterableReader | None = None
         request_content = content
+        activity = [None]
+        stream_opened = False
+
+        def mark_stream_opened():
+            nonlocal stream_opened
+            stream_opened = True
+
+        def receive_activity():
+            activity[0] = time.monotonic()
+
         if isinstance(content, AsyncIterable):
             async_reader = _AsyncIterableReader(content, curl)
             request_content = cast(SyncRequestContent, async_reader)
@@ -1774,6 +1867,8 @@ class AsyncSession(BaseSession[R]):
                 dns=self.dns if dns is None else dns,
                 doh_url=doh_url or self.doh_url,
                 stream=stream,
+                stream_activity=receive_activity if stream else None,
+                stream_response_callback=mark_stream_opened if stream else None,
                 max_recv_speed=max_recv_speed,
                 multipart=multipart,
                 cert=cert or self.cert,
@@ -1785,6 +1880,7 @@ class AsyncSession(BaseSession[R]):
         except BaseException:
             self.release_curl(curl)
             raise
+        self._set_request_limits(curl, _budget, _connect_timeout, stream)
         if async_reader is not None:
             async_reader.start()
         if stream:
@@ -1792,16 +1888,34 @@ class AsyncSession(BaseSession[R]):
             curl_released = False
 
             async def perform() -> None:
+                watcher = asyncio.create_task(
+                    _watch_stream(
+                        curl, self.acurl, task, quit_now, idle_timeout, activity
+                    )
+                )
                 try:
                     await task
                 except CurlError as e:
-                    rsp = self._parse_response(
+                    rsp = self._parse_error_response(
                         curl, buffer, header_buffer, default_encoding, discard_cookies
                     )
                     rsp.request = req
                     error = code2error(e.code, str(e))
-                    q.put_nowait(error(str(e), e.code, rsp))  # type: ignore
+                    exception = error(str(e), e.code, rsp, send_state=e.send_state)
+                    exception.__cause__ = e
+                    if stream_opened and _attempt_context is not None:
+                        controller = _attempt_context["controller"]
+                        exception.retry_info = RetryInfo(
+                            _attempt_context["attempt"],
+                            controller.elapsed,
+                            e.send_state,
+                            "stream_interrupted",
+                        )
+                    q.put_nowait(exception)  # type: ignore
                 finally:
+                    watcher.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await watcher
                     if async_reader is not None:
                         await async_reader.close()
                     if not cast(asyncio.Event, header_recved).is_set():
@@ -1817,7 +1931,16 @@ class AsyncSession(BaseSession[R]):
             stream_task = asyncio.create_task(perform())
             stream_task.add_done_callback(cleanup)
 
-            await cast(asyncio.Event, header_recved).wait()
+            try:
+                await cast(asyncio.Event, header_recved).wait()
+            except BaseException:
+                if _attempt_context is not None:
+                    _attempt_context["send_state"] = curl.send_state
+                stream_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stream_task
+                cleanup(stream_task)
+                raise
 
             # Unlike threads, coroutines does not use preemptive scheduling.
             # For asyncio, there is no need for a header_parsed event, the
@@ -1828,7 +1951,7 @@ class AsyncSession(BaseSession[R]):
             )
 
             first_element = _peek_aio_queue(q)  # type: ignore
-            if isinstance(first_element, RequestException):
+            if isinstance(first_element, RequestException) and not stream_opened:
                 if not curl_released:
                     self.release_curl(curl)
                 curl_released = True
@@ -1839,19 +1962,23 @@ class AsyncSession(BaseSession[R]):
             rsp.quit_now = quit_now
             rsp.queue = q
             if self.raise_for_status:
-                rsp.raise_for_status()
+                try:
+                    rsp.raise_for_status()
+                except RequestException:
+                    await rsp.aclose()
+                    raise
             return rsp
         else:
             try:
                 task = self.acurl.add_handle(curl)
                 await task
             except CurlError as e:
-                rsp = self._parse_response(
+                rsp = self._parse_error_response(
                     curl, buffer, header_buffer, default_encoding, discard_cookies
                 )
                 rsp.request = req
                 error = code2error(e.code, str(e))
-                raise error(str(e), e.code, rsp) from e
+                raise error(str(e), e.code, rsp, send_state=e.send_state) from e
             else:
                 rsp = self._parse_response(
                     curl, buffer, header_buffer, default_encoding, discard_cookies
@@ -1863,6 +1990,8 @@ class AsyncSession(BaseSession[R]):
             finally:
                 if async_reader is not None:
                     await async_reader.close()
+                if _attempt_context is not None:
+                    _attempt_context["send_state"] = curl.send_state
                 self.release_curl(curl)
 
     async def request(
@@ -1906,19 +2035,36 @@ class AsyncSession(BaseSession[R]):
         max_recv_speed: int = 0,
         multipart: Optional[CurlMime] = None,
         discard_cookies: bool = False,
+        retry: Optional[Union[int, RetryStrategy]] = None,
+        allow_replay: bool = False,
+        idle_timeout: Optional[float] = None,
+        on_attempt: Optional[AttemptCallback] = None,
     ) -> R:
         """Send the request, see ``curl_cffi.requests.request`` for details on args."""
 
         self._check_session_closed()
+        if idle_timeout is not None and (
+            not math.isfinite(idle_timeout) or idle_timeout <= 0
+        ):
+            raise ValueError("idle_timeout must be > 0")
 
         body = content if content is not None else data
         body_position = _capture_body_position(data, content)
-        strategy = self.retry
-        for attempt in range(strategy.count + 1):
-            if attempt:
-                _rewind_body(body, body_position)
+        strategy = self.retry if retry is None else _normalize_retry(retry)
+        controller = _RetryController(
+            strategy, allow_replay, on_attempt or self.on_attempt
+        )
+        for _attempt in range(strategy.count + 1):
+            context = {
+                "started": False,
+                "send_state": SendState.NOT_STARTED,
+                "controller": controller,
+                "attempt": controller.attempts + 1,
+            }
+            if controller.remaining is not None and controller.remaining <= 0:
+                raise controller.budget_error()
             try:
-                return await self._request_once(
+                operation = self._request_once(
                     method=method,
                     url=url,
                     params=params,
@@ -1956,13 +2102,37 @@ class AsyncSession(BaseSession[R]):
                     max_recv_speed=max_recv_speed,
                     multipart=multipart,
                     discard_cookies=discard_cookies,
+                    _budget=controller.timeout(
+                        self.timeout if timeout is NOT_SET else timeout
+                    ),
+                    _connect_timeout=strategy.connect_timeout,
+                    _attempt_context=context,
+                    idle_timeout=idle_timeout,
                 )
-            except RequestException:
-                if attempt == strategy.count:
+                try:
+                    limit = controller.timeout(
+                        self.timeout if timeout is NOT_SET else timeout
+                    )
+                    rsp = await asyncio.wait_for(operation, limit)
+                except asyncio.TimeoutError as cause:
+                    error = Timeout(
+                        "Request establishment/attempt deadline exceeded",
+                        code=28,
+                        send_state=context["send_state"],
+                    )
+                    raise error from cause
+            except Exception as error:
+                controller.attempts += int(context["started"])
+                controller.notify(error=error)
+                delay = controller.retry_delay(error, body, body_position, multipart)
+                if delay is None:
                     raise
-                delay = self._retry_delay(attempt + 1)
                 if delay:
                     await asyncio.sleep(delay)
+            else:
+                controller.attempts += int(context["started"])
+                controller.notify(response=rsp)
+                return rsp
 
     async def head(self, url: str, **kwargs: Unpack[RequestParams]) -> R:
         return await self.request(method="HEAD", url=url, **kwargs)

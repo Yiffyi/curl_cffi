@@ -808,8 +808,13 @@ def ws_server():
 
 
 @pytest.fixture(scope="session")
-def proxy_server(request):
-    ps = proxy.Proxy(port=8002, plugins=["proxy.plugin.ManInTheMiddlePlugin"])
+def proxy_server(request, tmp_path_factory):
+    ps = proxy.Proxy(
+        input_args=["--cache-dir", str(tmp_path_factory.mktemp("proxy-cache"))],
+        port=8002,
+        plugins=["proxy.plugin.ManInTheMiddlePlugin"],
+        data_dir=str(tmp_path_factory.mktemp("proxy-data")),
+    )
     request.addfinalizer(ps.__exit__)
     return ps.__enter__()
 

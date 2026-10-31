@@ -220,3 +220,51 @@ class _AsyncIterableReader:
         chunk = bytes(buffer[:size])
         del buffer[:size]
         return chunk
+
+
+async def _watch_stream(curl, acurl, future, quit_now, idle_timeout, activity):
+    """Watch reception at the producer, independently of consumer queue reads."""
+    import time
+
+    from .exceptions import Timeout
+
+    while not future.done():
+        if quit_now.is_set():
+            acurl.remove_handle(curl)
+            return
+        remaining = None
+        if idle_timeout is not None and activity[0] is not None:
+            remaining = idle_timeout - (time.monotonic() - activity[0])
+            if remaining <= 0:
+                acurl.set_exception(
+                    curl,
+                    Timeout(
+                        "Stream receive idle timeout",
+                        code=28,
+                        send_state=curl.send_state,
+                    ),
+                )
+                return
+        await asyncio.sleep(min(0.05, remaining) if remaining is not None else 0.05)
+
+
+def _perform_sync_stream(curl, quit_now, idle_timeout, activity):
+    # Multi owns the easy handle on this thread. It can be interrupted without
+    # calling libcurl concurrently from a close() or idle timer thread.
+    from ..aio import AsyncCurl
+
+    async def perform():
+        acurl = AsyncCurl()
+        future = acurl.add_handle(curl)
+        watcher = asyncio.create_task(
+            _watch_stream(curl, acurl, future, quit_now, idle_timeout, activity)
+        )
+        try:
+            await future
+        finally:
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+            await acurl.close()
+
+    asyncio.run(perform())

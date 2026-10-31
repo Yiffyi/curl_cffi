@@ -64,3 +64,26 @@ Contributing
 
 When opening PR, please do not use the ``main`` branch in your fork, otherwise I cannot
 add my modification, such as unittests.
+
+Pinned submodule builds in the containing project
+------------------------------------------------
+
+The containing project provides ``scripts/bootstrap-curl.sh``. From that project's
+root, run ``./scripts/bootstrap-curl.sh --locked``. It initializes a missing
+submodule, downloads the matching libcurl and curl-impersonate sources, patches and
+preprocesses headers, and rebuilds the editable CFFI extension with ``uv sync``.
+Existing submodule work is not reset. It requires Python 3, uv, make, curl, patch,
+a C compiler and the GNU autoreconf/libtool tools; Python's zipfile module handles
+source archive extraction.
+
+Downloads, preprocessing and temporary files live in ``tmp/build/curl-cffi``.
+``CURL_CFFI_BUILD_DIR`` selects another persistent build directory. The script
+sets ``TMPDIR`` and ``IMPERSONATE_BUILD_DIR`` for the build, copies generated
+headers to the submodule's ignored ``include`` directory, and explicitly
+reinstalls ``curl-cffi`` to compile new CFFI callbacks. Its final import check prints
+the actual package source path and native libcurl version. Further arguments are
+passed to ``uv sync``; for development dependencies use ``--group dev``.
+
+For an isolated validation environment, set ``UV_PROJECT_ENVIRONMENT`` to a local
+venv path before running the script. Do not remove the library directory while a
+dynamically linked extension still depends on it.

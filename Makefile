@@ -16,7 +16,7 @@ endif
 
 $(CURL_VERSION):
 	curl -fL --retry 3 https://github.com/curl/curl/archive/$(CURL_VERSION).zip -o curl.zip
-	unzip -q -o curl.zip
+	$(PYTHON) -m zipfile -e curl.zip .
 	mv curl-$(CURL_VERSION) $(CURL_VERSION)
 
 curl-impersonate-$(VERSION)/patches: $(CURL_VERSION)

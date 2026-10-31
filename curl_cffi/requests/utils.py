@@ -451,7 +451,7 @@ def _apply_fingerprint(
     curl.setopt(CurlOpt.TLS_STATUS_REQUEST, 1)
     curl.setopt(
         CurlOpt.TLS_SIGNED_CERT_TIMESTAMPS, int(fingerprint.tls_signed_cert_timestamps)
-        )
+    )
     curl.setopt(CurlOpt.TLS_KEY_SHARES_LIMIT, fingerprint.tls_key_shares_limit)
 
     if fingerprint.tls_cert_compression:
@@ -488,9 +488,7 @@ def _apply_fingerprint(
         curl.setopt(CurlOpt.ECH, fingerprint.tls_ech)
 
     if fingerprint.tls_trust_anchors is not None:
-        curl.setopt(
-            CurlOpt.TLS_TRUST_ANCHORS, ",".join(fingerprint.tls_trust_anchors)
-        )
+        curl.setopt(CurlOpt.TLS_TRUST_ANCHORS, ",".join(fingerprint.tls_trust_anchors))
 
     # http2 settings
     if fingerprint.http2_settings:
@@ -633,6 +631,7 @@ def set_curl_options(
     cert: Optional[Union[str, tuple[str, str]]] = None,
     stream: Optional[bool] = None,
     stream_response_callback: Optional[Callable[[], None]] = None,
+    stream_activity: Optional[Callable[[], None]] = None,
     max_recv_speed: int = 0,
     multipart: Optional[CurlMime] = None,
     queue_class: Any = None,
@@ -1021,24 +1020,74 @@ def set_curl_options(
         header_recved = event_class()
         quit_now = event_class()
 
-        def qput(chunk):
+        def open_stream():
             if not header_recved.is_set():
+                c.setopt(CurlOpt.TIMEOUT_MS, 0)
+                if stream_activity is not None:
+                    stream_activity()
                 if stream_response_callback is not None:
                     stream_response_callback()
                 header_recved.set()
+
+        def qput(chunk):
+            if stream_activity is not None:
+                stream_activity()
+            open_stream()
             if quit_now.is_set():
                 return CURL_WRITEFUNC_ERROR
             q.put_nowait(chunk)
             return len(chunk)
 
         c.setopt(CurlOpt.WRITEFUNCTION, qput)
+        if stream_activity is not None:
+            downloaded = 0
+
+            def receive_progress(dltotal, dlnow, ultotal, ulnow):
+                nonlocal downloaded
+                if dlnow > downloaded:
+                    # Counts received body bytes before content decoding. Compressed
+                    # ingress refreshes idle even when no decoded chunk is ready.
+                    stream_activity()
+                downloaded = dlnow
+                return 0
+
+            c.setopt(CurlOpt.XFERINFOFUNCTION, receive_progress)
+            c.setopt(CurlOpt.NOPROGRESS, 0)
     elif content_callback is not None:
         c.setopt(CurlOpt.WRITEFUNCTION, content_callback)
     else:
         buffer = BytesIO()
         c.setopt(CurlOpt.WRITEDATA, buffer)
     header_buffer = BytesIO()
-    c.setopt(CurlOpt.HEADERDATA, header_buffer)
+    if stream:
+        status = 0
+        has_location = False
+
+        def receive_header(line):
+            nonlocal status, has_location
+            header_buffer.write(line)
+            if header_recved.is_set() and stream_activity is not None:
+                stream_activity()
+            if line.startswith(b"HTTP/"):
+                status = int(line.split(None, 2)[1])
+                has_location = False
+            elif line.lower().startswith(b"location:"):
+                has_location = bool(line.split(b":", 1)[1].strip())
+            elif not line.strip() and status >= 200:
+                redirect = (
+                    status in (301, 302, 303, 307, 308)
+                    and has_location
+                    and bool(allow_redirects)
+                )
+                if not redirect:
+                    open_stream()
+            return len(line)
+
+        # CONNECT headers describe the proxy tunnel, not the target response.
+        c.setopt(CurlOpt.SUPPRESS_CONNECT_HEADERS, 1)
+        c.setopt(CurlOpt.HEADERFUNCTION, receive_header)
+    else:
+        c.setopt(CurlOpt.HEADERDATA, header_buffer)
 
     # interface
     if interface:
